@@ -1,0 +1,146 @@
+from pyzabbix.api import ZabbixAPI
+import calendar
+from time import strptime
+import json
+from flask import Flask, request #import main Flask class and request object
+import requests
+
+app = Flask(__name__) #create the Flask app
+
+
+def query_zabbix (ip_dict, timeFrom, timeTo):
+    
+    # Create ZabbixAPI class instance
+    zapi = ZabbixAPI(url='http://<IP_or_DOMAIN>/zabbix/', user='user', password='password')
+
+    allservices = allmonitored_services(zapi)
+    
+    results = {}
+    service_results = allservices["result"]
+    #loop through services to find IP address
+    for vmIP in ip_dict:
+        for service in service_results:
+
+            if service["name"].startswith(vmIP):
+                slaScore = query_sla(service["serviceid"],timeFrom, timeTo, zapi)
+                results[vmIP] = slaScore
+                #allSLAs["result"]
+                print ("serviceSLA is ",results)
+    
+        if vmIP not in results:
+            sid = add_new_service(zapi, vmIP)
+            try:
+                slaScore = query_sla(sid,timeFrom, timeTo, zapi)
+                results[vmIP] = int(slaScore)
+            except:
+                results[vmIP] = 0
+
+    # Logout from Zabbix
+    zapi.user.logout()
+    return results
+    
+#if SLA service doesnt exist for VMip, create it.
+def add_new_service(zapi, vmIP):
+                    # Get all monitored services
+    all_ip_triggers = zapi.do_request('trigger.get',
+            {
+                 "output": "extend",
+                 "host": vmIP
+             })
+    all_ip_triggers = all_ip_triggers["result"]
+    trigger_id = ''
+    for trigger in all_ip_triggers:
+        if trigger["description"].startswith('Unavailable by ICMP ping'):
+            triggerid = trigger["triggerid"]
+            print ("triggerid is ",triggerid)
+            
+    # Create SLA Service with triggerid
+    try:
+        new_service_id = zapi.do_request('service.create',
+        {
+            "name": vmIP + " Unavailable by ICMP ping",
+                "triggerid":int(triggerid),
+                "algorithm": 1,
+                "showsla": 1,
+                "goodsla": 0.000001,
+                "sortorder": 0
+        })
+        newservice = new_service_id["result"]
+        sid=newservice["serviceids"]
+        sid=sid[0]
+        return sid
+    except:
+        return 0
+        
+    
+def allmonitored_services (zapi):
+    # Get all monitored services
+    allservices = zapi.do_request('service.get',
+                              {
+                                  "output": "extend",
+                                  "selectDependencies": "extend"
+                            })
+    return allservices
+
+def query_sla(serviceid,timeFrom, timeTo, zapi):
+    getServiceSLA = zapi.do_request('service.getsla',
+                              {
+        "serviceids": serviceid,
+        "intervals": [
+            {
+                "from": timeFrom,
+                "to": timeTo
+            }
+        ]
+    })
+    slaDict = getServiceSLA["result"][serviceid]["sla"]
+    #percentage required
+    slaScore = int(slaDict[0]["sla"])/100
+    return slaScore
+    
+def query_am(deveui, jsondata, accessToken):
+  URL = "https://monitor.sensoterra.=CLAY&encoding=hex" %deveui
+
+  sensoTerraHeaders = {
+        'Content-Type': "application/json",
+        'Accept': "application/senml+json",
+        'Authorization': accessToken,
+        'Cache-Control': "no-cache",
+        }
+
+  r = requests.post(URL, json=jsondata, headers=sensoTerraHeaders)
+
+  responsedata = r.json()
+
+  print('Response: %s' % responsedata)
+  return responsedata
+  
+
+@app.route('/sla/monitor', methods=['POST']) #GET requests will be blocked
+def sla_monitor():
+  req_data = request.get_json()
+  timefrom = calendar.timegm(strptime(req_data['rstart'], '%Y-%m-%d %H:%M:%S %z'))
+  timeto = calendar.timegm(strptime(req_data['rend'], '%Y-%m-%d %H:%M:%S %z'))
+  nodes = req_data['nodes'] #"nodes": ["omf.netmode.node18", "omf.netmode.node7"]
+
+##call to AM
+#  responsedata = None
+#  try:
+#    responsedata = query_am(deveui, body, storedAccessToken)
+#    if 'error' in responsedata:
+#    #  storedAccessToken =  "Bearer " + request_oauth_token()
+#      responsedata = query_am(deveui, body, storedAccessToken)
+#  except:
+#    print('Unable to forward data do sensoterra')
+    
+  #query Zabbix
+  results = query_zabbix(nodes,timefrom,timeto)
+  # Serializing dict to json    
+  responsedata = json.dumps(results, indent = 4)   
+  print(responsedata)
+
+  return str(responsedata) if responsedata else "{error:'Unable to respond'}"
+
+
+if __name__ == '__main__':
+  app.run(debug=True, host='localhost', port=3000) #run runs on localhost port 3000
